@@ -4,6 +4,9 @@ venv/
 env/
 lwd_venv/
 
+# Environment file
+.env
+
 # Python cache
 __pycache__/
 *.py[cod]
