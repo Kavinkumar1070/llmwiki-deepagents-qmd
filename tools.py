@@ -1,13 +1,21 @@
 """
-Small deterministic tools that stand in for the `sha256sum` / `date` shell
-calls the original Codex SKILL.md files told the model to run itself,
-plus QMD search/reindex tools for the wiki-query and wiki-ingest
-subagents.
+Small deterministic tools that stand in for the `sha256sum` shell call the
+original Codex SKILL.md files told the model to run itself, plus QMD
+search/reindex tools for the wiki-query and wiki-ingest subagents.
 
-Doing hashing/timestamps in real Python instead of trusting the model to
-compute (or transcribe) them is the one behavioral change from the Codex
-version worth calling out: it removes a class of error where the model
-"helpfully" reformats a hash or fabricates a plausible-looking timestamp.
+Doing hashing in real Python instead of trusting the model to compute (or
+transcribe) it is the one behavioral change from the Codex version worth
+calling out: it removes a class of error where the model "helpfully"
+reformats a hash.
+
+Note: there used to be a `utc_now` tool here too, for skills to
+self-report timestamps/durations into wiki/latency.log. That's gone -
+timing is now captured entirely in code, by a LangChain callback
+(LatencyLogger) in agent.py that measures real wall-clock time around
+each subagent invocation and around the whole agent.invoke() call. See
+agent.py. Removing utc_now removes the class of error where the model
+skips a checkpoint, reorders one, or gets the subtraction wrong when
+hand-writing the JSON log line - it no longer has to do either.
 
 Flow tracing: every tool below is wrapped with @log_call() so you can
 watch each call happen live (console, and optionally a file) instead of
@@ -24,7 +32,6 @@ agent. The tools below assume the `wiki` collection already exists.
 from __future__ import annotations
 
 import hashlib
-from datetime import datetime, timezone
 
 from langchain_core.tools import tool
 
@@ -92,21 +99,6 @@ def sha256_file(path: str) -> str:
         return f"ERROR: file not found: {path}"
     except OSError as e:
         return f"ERROR: could not read {path}: {e}"
-
-
-@tool
-@log_call()
-def utc_now() -> str:
-    """Return the current UTC time, once as a Unix epoch float (for latency
-    math, replacing `date +%s.%N`) and once as ISO-8601 (for log entries,
-    replacing `date -u +%FT%TZ`).
-
-    Returns a string like: "epoch=1737992400.123456 iso=2026-07-09T12:00:00Z"
-    """
-    now = datetime.now(timezone.utc)
-    epoch = now.timestamp()
-    iso = now.strftime("%Y-%m-%dT%H:%M:%SZ")
-    return f"epoch={epoch:.6f} iso={iso}"
 
 
 @tool

@@ -22,6 +22,8 @@ import requests
 
 from flow_logger import log_call, logger
 from qmd.query_transform import transform_query
+from dotenv import load_dotenv
+load_dotenv()
 
 MCP_URL = "http://localhost:8181/mcp"
 HEADERS = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
@@ -39,8 +41,8 @@ MCP_TIMEOUT = int(os.environ.get("QMD_MCP_TIMEOUT", "200"))
 # hyde is OFF by default - see search_hybrid's docstring. Kept separate
 # from the vec slowness below; hyde adds its own server-side generation
 # on top and has caused outright hangs beyond even the ~170s vec cost.
-ENABLE_HYDE = os.environ.get("QMD_ENABLE_HYDE", "1") == "1"
-HYDE_ATTEMPT_TIMEOUT = int(os.environ.get("QMD_HYDE_TIMEOUT", "60"))
+ENABLE_HYDE = os.environ.get("QMD_ENABLE_HYDE", "0") == "1"
+HYDE_ATTEMPT_TIMEOUT = int(os.environ.get("QMD_HYDE_TIMEOUT", "120"))
 
 # vec is ON by default but is the confirmed source of the ~150-170s
 # per-call cost. Set QMD_ENABLE_VEC=0 for a fast (near-instant),

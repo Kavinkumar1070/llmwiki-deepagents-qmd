@@ -1,12 +1,9 @@
-## Entities
-
 ## Concepts
-wiki/pages/agentic-rag.md - Dynamic RAG pattern where an agent decides when and how to retrieve information.
-wiki/pages/genai-rag-agents-multi-agent-systems.md - Overview of the four-layer stack spanning GenAI, RAG, agents, and multi-agent systems.
-wiki/pages/rag-implementation-patterns.md - Production-oriented guidance for building, optimizing, and evaluating RAG systems.
-wiki/pages/vector-search-techniques.md - Comparison of major vector retrieval approaches used in RAG systems.
+- `wiki/pages/vector-search.md` — Overview of vector search, its role in RAG, and future directions from an introductory source.
+- `wiki/pages/exact-nearest-neighbor-search.md` — Defines exact nearest neighbor search and outlines its exhaustive distance-computation workflow.
+- `wiki/pages/approximate-nearest-neighbor-search.md` — Explains approximate nearest neighbor search as a speed-accuracy tradeoff for large-scale retrieval.
+- `wiki/pages/semantic-search.md` — Describes semantic search as meaning-based retrieval using embeddings and similarity metrics.
+- `wiki/pages/sparse-vector-search.md` — Summarizes sparse vector search for high-dimensional representations with many zero-valued features.
 
 ## Summaries
-wiki/pages/4-types-of-vector-search-in-rag-summary.md - Start-here summary for the vector search explainer source.
-wiki/pages/genai-rag-agents-multiagent-summary.md - Start-here summary for the GenAI/RAG/agents/multi-agent primer.
-wiki/pages/rag-complete-guide-summary.md - Start-here summary for the production RAG implementation guide.
+- `wiki/pages/4-types-of-vector-search-in-rag-summary.md` — Source overview linking the vector-search concept pages derived from the PDF.

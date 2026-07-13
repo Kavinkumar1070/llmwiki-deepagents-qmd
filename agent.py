@@ -29,8 +29,13 @@ Usage:
 """
 from __future__ import annotations
 
+import ast
+import json
 import os
+import re
 import sys
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -60,11 +65,11 @@ import yaml
 from dotenv import load_dotenv
 from deepagents import create_deep_agent
 from deepagents.backends import FilesystemBackend
+from langchain_core.callbacks import BaseCallbackHandler
 
 from tools import (
     read_pdf_text,
     sha256_file,
-    utc_now,
     qmd_reindex_wiki,
     qmd_search_wiki,
 )
@@ -72,20 +77,24 @@ from tools import (
 PROJECT_DIR = Path(__file__).resolve().parent
 SUBAGENTS_DIR = PROJECT_DIR / "subagents"
 AGENTS_MD = PROJECT_DIR / "AGENTS.md"
+LATENCY_LOG = PROJECT_DIR / "wiki" / "latency.log"
 
 load_dotenv(PROJECT_DIR / ".env")
 
 # Each subagent only gets the tools its own subagents/*.md actually calls:
 #   wiki-ingest hashes raw/ files, reads PDFs, and reindexes QMD after
-#     writing -> needs all four
-#   wiki-query searches QMD first to find candidate pages, then times its
-#     latency log -> needs utc_now, qmd_search_wiki
-#   wiki-lint is read-only over wiki/ content but timestamps its own
-#     latency.log entry -> needs utc_now only, never touches QMD or raw/
+#     writing -> needs all three
+#   wiki-query searches QMD first to find candidate pages -> needs
+#     qmd_search_wiki only
+#   wiki-lint is read-only over wiki/ content -> needs no tools of its own
+# Timing used to be a fourth reason subagents needed a tool (utc_now) -
+# that's gone now. See LatencyLogger below: wall-clock timing is measured
+# in code, around the `task` tool call, so no subagent has to self-report
+# a timestamp.
 TOOLS_BY_SUBAGENT = {
-    "wiki-ingest": [sha256_file, utc_now, read_pdf_text, qmd_reindex_wiki],
-    "wiki-query": [utc_now, qmd_search_wiki],
-    "wiki-lint": [utc_now],
+    "wiki-ingest": [sha256_file, read_pdf_text, qmd_reindex_wiki],
+    "wiki-query": [qmd_search_wiki],
+    "wiki-lint": [],
 }
 
 
@@ -113,11 +122,6 @@ def load_subagents() -> list[dict]:
             reminders.append(
                 "Always call the `sha256_file` tool to hash a raw/ file - "
                 "never compute or guess a hash yourself."
-            )
-        if utc_now in tools:
-            reminders.append(
-                "Always call the `utc_now` tool to get the current time - "
-                "never compute or guess a timestamp yourself."
             )
         if qmd_search_wiki in tools:
             reminders.append(
@@ -152,6 +156,186 @@ def load_subagents() -> list[dict]:
     return subagents
 
 
+class LatencyLogger(BaseCallbackHandler):
+    """Code-side, model-independent latency capture for subagent (`task`)
+    invocations.
+
+    This replaces the old scheme where each skill called a `utc_now` tool
+    at several checkpoints, hand-copied the epoch values, and hand-wrote
+    the subtraction into a JSON log line. That put both the clock *and*
+    the arithmetic in the model's hands - it could skip a checkpoint,
+    reorder one, reuse a stale value, or just write bad JSON.
+
+    Here, timing is measured with Python's own monotonic clock around the
+    `task` tool call the router uses to invoke each subagent, and the log
+    line is written by this code, not by the LLM. The subagent's final
+    report text comes straight from the tool's return value
+    (`on_tool_end`'s `output`), so wiki-query no longer has to retype its
+    own answer into the log - we just capture what it actually returned.
+
+    Tool-call attribution uses a start-order stack, not `parent_run_id`
+    equality: a subagent's own tool calls (sha256_file, read_pdf_text,
+    qmd_search_wiki, qmd_reindex_wiki, ...) happen several levels down
+    inside the subgraph the `task` tool invokes, so their `parent_run_id`
+    doesn't point directly at the `task` run - it points at whatever
+    LangGraph node called them. Instead, whenever a `task` call is open,
+    every tool call that starts before it closes is attributed to it.
+    This is correct for the sequential, single-subagent-at-a-time flow
+    this router uses; if the router ever fires multiple `task` calls
+    concurrently, calls made during the overlap would attribute to the
+    most recently opened task rather than being split precisely between
+    them.
+    """
+
+    TASK_TOOL_NAME = "task"
+
+    def __init__(self, log_path: Path):
+        self.log_path = log_path
+        # run_id (str) -> span dict
+        self._spans: dict[str, dict] = {}
+        # run_ids of currently-open `task` calls, in start order (a stack)
+        self._task_stack: list[str] = []
+
+    # -- LangChain callback hooks -----------------------------------------
+
+    def on_tool_start(self, serialized, input_str, *, run_id, parent_run_id=None, **kwargs):
+        key = str(run_id)
+        tool_name = (serialized or {}).get("name", "unknown")
+        span = {
+            "tool": tool_name,
+            "start": time.perf_counter(),
+            "parent_run_id": str(parent_run_id) if parent_run_id else None,
+            "input": input_str,
+            "error": None,
+        }
+        if tool_name != self.TASK_TOOL_NAME and self._task_stack:
+            span["owning_task"] = self._task_stack[-1]
+        self._spans[key] = span
+
+        if tool_name == self.TASK_TOOL_NAME:
+            self._task_stack.append(key)
+
+    def on_tool_error(self, error, *, run_id, **kwargs):
+        span = self._spans.get(str(run_id))
+        if span is not None:
+            span["error"] = str(error)
+        self._finish_tool(run_id, output=None)
+
+    def on_tool_end(self, output, *, run_id, **kwargs):
+        self._finish_tool(run_id, output=output)
+
+    # -- internals ----------------------------------------------------------
+
+    def _finish_tool(self, run_id, output):
+        key = str(run_id)
+        span = self._spans.get(key)
+        if span is None or "end" in span:
+            return
+        span["end"] = time.perf_counter()
+        span["duration_s"] = round(span["end"] - span["start"], 6)
+        span["output"] = output
+
+        if span["tool"] == self.TASK_TOOL_NAME:
+            if self._task_stack and self._task_stack[-1] == key:
+                self._task_stack.pop()
+            elif key in self._task_stack:
+                self._task_stack.remove(key)  # out-of-order close, be defensive
+            self._write_log_line(key, span)
+
+    def _owned_spans(self, run_id: str) -> list[dict]:
+        """Tool calls attributed to this task while it was open, in call
+        order (dict insertion order == start order)."""
+        return [
+            {"tool": s["tool"], "duration_s": s.get("duration_s"), "error": s["error"]}
+            for rid, s in self._spans.items()
+            if rid != run_id and s.get("owning_task") == run_id
+        ]
+
+    def _write_log_line(self, run_id: str, span: dict) -> None:
+        subagent_type, description = self._parse_task_input(span["input"])
+        report_text = self._stringify_output(span["output"])
+
+        entry = {
+            "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "op": subagent_type or "unknown",
+            "query": description,
+            "total_s": span["duration_s"],
+            "success": span["error"] is None,
+            "tool_calls": self._owned_spans(run_id),
+        }
+        if report_text:
+            entry["report"] = report_text
+            sources = self._extract_sources_line(report_text)
+            if sources:
+                entry["sources"] = sources
+        if span["error"]:
+            entry["error"] = span["error"]
+
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+    @staticmethod
+    def _parse_task_input(raw):
+        """The `task` tool's input carries which subagent was called and
+        the description/prompt passed to it. Observed in practice: this
+        arrives as a plain Python dict's str()/repr() - single-quoted,
+        NOT valid JSON (e.g. "{'subagent_type': 'wiki-ingest', ...}").
+        Try JSON first in case a future/different LangChain version hands
+        us real JSON, then fall back to ast.literal_eval for the Python-
+        repr case, which is what's actually been observed."""
+        data = raw
+        if isinstance(raw, str):
+            parsed = None
+            try:
+                parsed = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                try:
+                    parsed = ast.literal_eval(raw)
+                except (ValueError, SyntaxError):
+                    parsed = None
+            data = parsed if parsed is not None else raw
+        if isinstance(data, dict):
+            return data.get("subagent_type"), data.get("description")
+        return None, str(raw) if raw is not None else None
+
+    @staticmethod
+    def _stringify_output(output) -> str | None:
+        if output is None:
+            return None
+        if isinstance(output, str):
+            return output
+
+        # Observed in practice: deepagents' `task` tool returns a
+        # LangGraph `Command(update={'files': {...}, 'messages': [...]})`
+        # rather than a plain string. The subagent's actual report text
+        # is the content of the last message in update['messages'].
+        update = getattr(output, "update", None)
+        if isinstance(update, dict):
+            messages = update.get("messages")
+            if isinstance(messages, list) and messages:
+                content = getattr(messages[-1], "content", None)
+                if isinstance(content, str):
+                    return content
+
+        # ToolMessage or similar returned directly - commonly exposes .content
+        content = getattr(output, "content", None)
+        if isinstance(content, str):
+            return content
+
+        return str(output)
+
+    @staticmethod
+    def _extract_sources_line(report_text: str) -> list[str] | None:
+        """wiki-query's report ends with a literal `Sources: a, b, c` line
+        (see subagents/wiki-query.md) - pull it out for structured
+        logging without asking the model to also emit a separate list."""
+        match = re.search(r"^Sources:\s*(.+)$", report_text, re.MULTILINE)
+        if not match:
+            return None
+        return [p.strip() for p in match.group(1).split(",") if p.strip()]
+
+
 ROUTER_PROMPT = """You are the LLM Wiki orchestrator. You maintain a
 persistent, compounding markdown knowledge base in wiki/, built from
 immutable source files in raw/ (Karpathy's LLM Wiki pattern).
@@ -173,9 +357,16 @@ its intermediate tool calls) reaches you. If the request is ambiguous
 first, or run ingest then query in sequence if the user clearly wants
 both.
 
+You'll see a system message giving today's date in UTC. When you
+delegate to the ingest subagent, always include that date in the task
+description (e.g. "Today's date: 2026-07-13 (UTC)") - it has no other
+way to know the real current date and needs it for the wiki/log.md
+changelog entry it writes. Other subagents don't need it.
+
 When you call the `task` tool, the `description` you pass IS what the
-subagent sees and IS what it logs (e.g. wiki-query writes it verbatim,
-truncated to 80 chars, into wiki/latency.log). Always start the
+subagent sees, and it is also what the harness records as `query` in
+wiki/latency.log (that logging happens automatically in code around this
+tool call - you don't write to latency.log yourself). Always start the
 description with the user's original wording, quoted exactly, e.g.:
   User asked: "<verbatim user message>"
   <any extra routing context you need to add>
@@ -282,7 +473,15 @@ def _check_qmd_server() -> None:
 def build_agent():
     """Construct the deep agent, backed by real files under this project
     directory (mirrors the Codex version writing directly to ./raw and
-    ./wiki on disk, instead of an ephemeral in-memory filesystem)."""
+    ./wiki on disk, instead of an ephemeral in-memory filesystem).
+
+    Returns (agent, invoke_config): pass invoke_config into every
+    `agent.invoke(...)` call (as the `config=` kwarg) so the LatencyLogger
+    callback is attached to the run. It's returned rather than bound with
+    `.with_config()` so this works the same regardless of whether the
+    installed deepagents/langgraph version supports callback binding on
+    the compiled graph itself.
+    """
     _check_qmd_server()
 
     backend = FilesystemBackend(root_dir=_win_long_path(PROJECT_DIR), virtual_mode=True)
@@ -293,16 +492,62 @@ def build_agent():
         system_prompt=ROUTER_PROMPT,
         subagents=load_subagents(),
     )
-    return agent
+
+    latency_logger = LatencyLogger(LATENCY_LOG)
+    invoke_config = {"callbacks": [latency_logger]}
+    return agent, invoke_config
+
+
+def _log_invoke_total(message: str, total_s: float) -> None:
+    """True end-to-end wall time for one agent.invoke() call - from the
+    user's message going in to the final assistant reply coming out.
+
+    This is deliberately a *separate* log entry from the per-subagent
+    ("op": "wiki-ingest" / "wiki-query" / "wiki-lint") lines LatencyLogger
+    writes. Those only cover the `task` tool's own span - they exclude
+    the router's own LLM turn to decide which subagent to call and draft
+    its description (before the task call starts) and its turn to relay
+    the subagent's report back to you (after the task call ends). Compare
+    this "invoke" total_s against the nearest "wiki-*" total_s logged in
+    the same window to see how much time sat outside the subagent - i.e.
+    router overhead, or anything else outside the graph's tool calls.
+    """
+    entry = {
+        "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "op": "invoke",
+        "query": message,
+        "total_s": round(total_s, 6),
+    }
+    LATENCY_LOG.parent.mkdir(parents=True, exist_ok=True)
+    with open(LATENCY_LOG, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def _invoke_and_print(agent, message: str, invoke_config: dict) -> None:
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    messages = [
+        {
+            "role": "system",
+            "content": f"Today's date: {today} (UTC). This is ground truth from the "
+            "host system clock, not a guess - use it for anything date-related "
+            "(e.g. wiki/log.md entries), never your own training-cutoff date.",
+        },
+        {"role": "user", "content": message},
+    ]
+
+    t0 = time.perf_counter()
+    result = agent.invoke({"messages": messages}, config=invoke_config)
+    t1 = time.perf_counter()
+    _log_invoke_total(message, t1 - t0)
+    print(result["messages"][-1].content)
 
 
 def main():
-    agent = build_agent()
+    agent, invoke_config = build_agent()
     query = " ".join(sys.argv[1:]).strip()
 
     if query:
-        result = agent.invoke({"messages": [{"role": "user", "content": query}]})
-        print(result["messages"][-1].content)
+        _invoke_and_print(agent, query, invoke_config)
         return
 
     print("LLM Wiki (Deep Agents) - interactive mode. Ctrl-D to exit.")
@@ -314,8 +559,7 @@ def main():
             break
         if not line:
             continue
-        result = agent.invoke({"messages": [{"role": "user", "content": line}]})
-        print(result["messages"][-1].content)
+        _invoke_and_print(agent, line, invoke_config)
 
 
 if __name__ == "__main__":

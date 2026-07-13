@@ -8,8 +8,6 @@ description: >
 
 # Wiki lint
 
-0. Call `utc_now` and note the epoch value as T0.
-
 Check for and report (do not auto-fix without confirmation):
 1. Orphan pages - no inbound links from any other page or from index.md.
 2. Broken cross-links - links pointing to pages that don't exist.
@@ -23,10 +21,10 @@ Check for and report (do not auto-fix without confirmation):
 
 Output a short report grouped by check, then ask the user which findings
 to act on. This subagent is read-only for wiki/*.md content - never
-modify any existing page here.
+modify any existing page here, and never write to wiki/latency.log
+yourself either.
 
-Logging is the one exception to read-only: after producing the report,
-call `utc_now` again and note the epoch value as T1, then append one
-line to wiki/latency.log (create it if it doesn't exist - this is an
-append-only activity log, not wiki content):
-`{"ts":"<T1 iso value>","op":"lint","orphans":<count>,"broken_links":<count>,"unresolved_contradictions":<count>,"stale_pages":<count>,"missing_frontmatter":<count>,"missing_summary":<count>,"total_s":<T1-T0>}`
+Note: wiki/latency.log is written automatically by a code-side callback
+in agent.py, which measures real wall-clock time around this subagent's
+invocation and captures your final report text from the return value -
+nothing to log here.

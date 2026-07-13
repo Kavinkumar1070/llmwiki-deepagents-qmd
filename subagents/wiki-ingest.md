@@ -8,7 +8,6 @@ description: >
 
 # Wiki ingest
 
-0. Call `utc_now` and note the epoch value as T0.
 1. For every file in raw/, call the `sha256_file` tool on it. Compare
    against the hash recorded in that file's most recent wiki/log.md entry:
    - No log entry for this path -> NEW.
@@ -49,8 +48,9 @@ description: >
 4. Update wiki/index.md with one line per touched or new page.
 5. Append one entry per ingested source to wiki/log.md, including the
    sha256 hash (from `sha256_file`) so future runs can detect edits.
-   Use the ISO date from `utc_now` (the iso value up to the day, not a
-   guessed date):
+   Use today's date exactly as given to you in the task description
+   (the router provides it as "today's date: YYYY-MM-DD (UTC)") - never
+   guess a date and never fall back on your own training-cutoff date:
    `## [YYYY-MM-DD] ingest | <source path> (sha256:<hash>) | <pages touched>`
 6. If more than one reasonable way to file a source exists, ask the user
    before writing.
@@ -61,10 +61,8 @@ description: >
    never mid-run, never per-page, and never before log.md is updated.
    If this run touched zero NEW/CHANGED sources (everything was already
    up to date in step 1), skip this call — there is nothing new to index.
-8. Call `utc_now` again and note the epoch value as T1. Append one line
-   to wiki/latency.log (create it if it doesn't exist):
-   `{"ts":"<T1 iso value>","op":"ingest","query":"<sources ingested, comma-separated, full list, no truncation>","sources":["<raw/ path>", ...],"pages_touched":["<wiki/ path>", ...],"contradictions":<count>,"total_s":<T1-T0>}`
-   `sources` here is the list of raw/ files ingested this run (NEW/CHANGED
-   only, not skipped ones). `contradictions` is how many `> CONTRADICTION:`
-   notes were added this run. JSON-escape any `"`, `\`, or newlines the
-   same way wiki-query does.
+
+Note: wiki/latency.log is no longer written by this skill. Timing
+(total_s) and the final report text are captured automatically by a
+code-side callback in agent.py that measures real wall-clock time around
+this subagent's invocation - nothing to do here.
